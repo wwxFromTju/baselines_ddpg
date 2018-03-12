@@ -9,13 +9,12 @@ import tensorflow as tf
 from mpi4py import MPI
 
 
-def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, param_noise, actor, critic,
+def train(env, nb_epochs, nb_epoch_cycles, reward_scale, param_noise, actor, critic,
     normalize_returns, normalize_observations, critic_l2_reg, actor_lr, critic_lr, action_noise,
-    popart, gamma, clip_norm, nb_train_steps, nb_rollout_steps, nb_eval_steps, batch_size, memory,
-    tau=0.01, eval_env=None, param_noise_adaption_interval=50, store_weights=False, env_id=''):
-    rank = MPI.COMM_WORLD.Get_rank()
+    popart, gamma, clip_norm, nb_train_steps, nb_rollout_steps, batch_size, memory,
+    tau=0.01, param_noise_adaption_interval=50, store_weights=False, env_id=''):
 
-    assert (np.abs(env.action_space.low) == env.action_space.high).all()
+    rank = MPI.COMM_WORLD.Get_rank()
     max_action = env.action_space.high
 
     agent = DDPG(actor, critic, memory, env.observation_space.shape, env.action_space.shape,
@@ -24,13 +23,13 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
         actor_lr=actor_lr, critic_lr=critic_lr, enable_popart=popart, clip_norm=clip_norm,
         reward_scale=reward_scale)
 
+    # 用来记录训练中的reward，可以通过reward的变化来判断agent是否学到了
     summary_writer = tf.summary.FileWriter('./log')
+    training_episode_reward = tf.Variable(0, dtype=tf.float32)
+    training_episode_reward_op = tf.summary.scalar('mean_episode_reward', training_episode_reward)
+    training_epoch_reward = tf.Variable(0, dtype=tf.float32)
+    training_epoch_reward_op = tf.summary.scalar('mean_epoch_reward', training_epoch_reward)
 
-    training_reward = tf.Variable(0, dtype=tf.float32)
-    training_reward_op = tf.summary.scalar('mean_reward', training_reward)
-
-    eval_episode_rewards_history = deque(maxlen=100)
-    episode_rewards_history = deque(maxlen=100)
     sess = U.single_threaded_session()
     sess.__enter__()
 
@@ -39,97 +38,59 @@ def train(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, pa
 
     agent.reset()
     obs = env.reset()
-    if eval_env is not None:
-        eval_obs = eval_env.reset()
 
     episode_reward = 0.
-    episode_step = 0
     episodes = 0
     t = 0
 
     epoch_episode_rewards = []
-    epoch_episode_steps = []
-    epoch_actions = []
-    epoch_qs = []
     epoch_episodes = 0
     for epoch in range(nb_epochs):
         for cycle in range(nb_epoch_cycles):
-            # Perform rollouts.
+            # rollout 收集数据
             for t_rollout in range(nb_rollout_steps):
-                # Predict next action.
                 action, q = agent.pi(obs, apply_noise=True, compute_Q=True)
-                assert action.shape == env.action_space.shape
-
-                # Execute next action.
-                if rank == 0 and render:
-                    env.render()
-                assert max_action.shape == action.shape
-                new_obs, r, done, info = env.step(
-                    max_action * action)  # scale for execution in env (as far as DDPG is concerned, every action is in [-1, 1])
+                # 注意一下model里面的激活函数是tanh，所以这边scale一下，到实际中环境中的action的range
+                new_obs, r, done, info = env.step(max_action * action)
                 t += 1
-                if rank == 0 and render:
-                    env.render()
                 episode_reward += r
-                episode_step += 1
 
-                # Book-keeping.
-                epoch_actions.append(action)
-                epoch_qs.append(q)
+                # 将transition存储在一起
                 agent.store_transition(obs, action, r, new_obs, done)
                 obs = new_obs
 
+                # 主要是reset，顺便记录一下summary
                 if done:
-                    # Episode done.
-                    epoch_episode_rewards.append(episode_reward)
-                    episode_rewards_history.append(episode_reward)
-                    epoch_episode_steps.append(episode_step)
-                    episode_reward = 0.
-                    episode_step = 0
-                    epoch_episodes += 1
-                    episodes += 1
-
+                    # 记录一下每个episode的平均reward
                     if rank == 0:
                         summary_writer.add_summary(
-                            sess.run(training_reward_op, {training_reward: np.mean(epoch_episode_rewards)}), episodes)
+                            sess.run(training_episode_reward_op, {training_episode_reward: np.mean(episode_reward)}), episodes)
+                        summary_writer.add_summary(
+                            sess.run(training_epoch_reward_op, {training_epoch_reward: np.mean(epoch_episode_rewards)}),
+                            episodes)
+                        print('Episode:{}, Reward:{}'.format(episodes, np.mean(episode_reward)))
+                        print('Episode:{}, Epoch Reward:{}'.format(episodes, np.mean(epoch_episode_rewards)))
+
+                    epoch_episode_rewards.append(episode_reward)
+                    episode_reward = 0.
+                    epoch_episodes += 1
+                    episodes += 1
 
                     agent.reset()
                     obs = env.reset()
 
-            # Train.
-            epoch_actor_losses = []
-            epoch_critic_losses = []
-            epoch_adaptive_distances = []
+            # 训练网络
             for t_train in range(nb_train_steps):
-                # Adapt param noise, if necessary.
+                # 调节一下noise的参数
                 if memory.nb_entries >= batch_size and t_train % param_noise_adaption_interval == 0:
-                    distance = agent.adapt_param_noise()
-                    epoch_adaptive_distances.append(distance)
-
-                cl, al = agent.train()
-                epoch_critic_losses.append(cl)
-                epoch_actor_losses.append(al)
+                    agent.adapt_param_noise()
+                # 训练网络
+                agent.train()
+                # 更新target网络
                 agent.update_target_net()
 
-            # Evaluate.
-            eval_episode_rewards = []
-            eval_qs = []
-            if eval_env is not None:
-                eval_episode_reward = 0.
-                for t_rollout in range(nb_eval_steps):
-                    eval_action, eval_q = agent.pi(eval_obs, apply_noise=False, compute_Q=True)
-                    eval_obs, eval_r, eval_done, eval_info = eval_env.step(
-                        max_action * eval_action)  # scale for execution in env (as far as DDPG is concerned, every action is in [-1, 1])
-                    if render_eval:
-                        eval_env.render()
-                    eval_episode_reward += eval_r
 
-                    eval_qs.append(eval_q)
-                    if eval_done:
-                        eval_obs = eval_env.reset()
-                        eval_episode_rewards.append(eval_episode_reward)
-                        eval_episode_rewards_history.append(eval_episode_reward)
-                        eval_episode_reward = 0.
-
+    # 存储NN的权重
     if rank == 0:
         path_pre = './weights/'
         if MPI.COMM_WORLD.Get_rank() == 0 and store_weights:

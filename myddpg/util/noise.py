@@ -33,6 +33,7 @@ class ActionNoise(object):
         pass
 
 
+# 高斯分布
 class NormalActionNoise(ActionNoise):
     def __init__(self, mu, sigma):
         self.mu = mu

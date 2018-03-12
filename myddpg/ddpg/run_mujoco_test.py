@@ -1,5 +1,4 @@
 import argparse
-import os
 
 from myddpg.util.util import (
     set_global_seeds,
@@ -8,7 +7,7 @@ from myddpg.util.util import (
 import myddpg.ddpg.testing as testing
 from myddpg.ddpg.models import Actor, Critic
 from myddpg.ddpg.memory import Memory
-from myddpg.ddpg.noise import *
+from myddpg.util.noise import *
 
 import gym
 import tensorflow as tf

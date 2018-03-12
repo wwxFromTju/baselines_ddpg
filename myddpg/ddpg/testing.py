@@ -26,14 +26,12 @@ def test(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, par
     sess.__enter__()
 
     agent.initialize(sess)
-    # sess.graph.finalize()
 
     agent.reset()
     obs = env.reset()
 
     if rank == 0:
         path_pre = './weights/'
-
         assert os.path.exists(path_pre) and os.path.exists(path_pre + env_id), 'don\'t exit the dirctory'
         sess = tf.get_default_session()
         saver = tf.train.Saver()
@@ -42,11 +40,11 @@ def test(env, nb_epochs, nb_epoch_cycles, render_eval, reward_scale, render, par
 
     for epoch in range(nb_epochs):
         for cycle in range(nb_epoch_cycles):
-            # Perform rollouts.
             for t_rollout in range(nb_rollout_steps):
                 # Predict next action.
                 action, q = agent.pi(obs, apply_noise=False, compute_Q=True)
-                new_obs, r, done, info = env.step( max_action * action)  # scale for execution in env (as far as DDPG is concerned, every action is in [-1, 1])
+                # scale for execution in env (as far as DDPG is concerned, every action is in [-1, 1])
+                new_obs, r, done, info = env.step( max_action * action)
                 env.render()
 
                 obs = new_obs
